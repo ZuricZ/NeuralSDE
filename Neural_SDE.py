@@ -9,7 +9,8 @@ import os
 import time
 import itertools
 import matplotlib.pyplot as plt
-from scipy import stats
+import utils
+
 
 torch.manual_seed(1)
 
@@ -218,11 +219,13 @@ def train_models(seedused):
                     OTM_call=OTM_call, ITM_put=ITM_put, OTM_put=OTM_put, n_layers=2, vNetWidth=20, device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, eps=1e-08, amsgrad=True, betas=(0.9, 0.999),
                                  weight_decay=0)
+
+
     # optimizer= torch.optim.Rprop(model.parameters(), lr=0.001, etas=(0.5, 1.2), step_sizes=(1e-07, 1))
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 200], gamma=0.1)
     loss_bool = False
 
-    n_epochs = 25  # 200
+    n_epochs = 5  # 200
     itercount = 0
 
     MC_samples_gen = 200000
@@ -287,6 +290,7 @@ def train_models(seedused):
 
             t_backprop = time.time()
             loss.backward()
+            # utils.plt_grads(model.diffusionV.h_h[0][0].weight.grad)
             optimizer.step()
             t_backprop = time.time() - t_backprop
             print('Forward pass time: %.3f || Backprop time: %.3f' % (t_fwd, t_backprop))
@@ -317,6 +321,39 @@ def train_models(seedused):
             #     continue
 
     return seedused, model
+
+
+def MC_paths(model, S0, V0, rate, timegrid, N=10):
+    h = timegrid[1] - timegrid[0]
+    S_old, V_old = torch.repeat_interleave(S0, N, dim=0), torch.repeat_interleave(V0, N, dim=0)
+    S_path, V_path = np.zeros((N, len(timegrid))), np.zeros((N, len(timegrid)))
+    S_path[:, 0], V_path[:, 0] = S0, V0
+
+    for idx, t in enumerate(timegrid[1:]):
+        dW, dW1 = torch.sqrt(h) * torch.randn((N, 1)), torch.sqrt(h) * torch.randn((N, 1))
+        input_time = torch.ones(N, 1) * t
+        inputNN = torch.cat([input_time, S_old.float(), V_old.float()], 1)
+        inputRho = torch.cat([input_time, dW, dW1], 1)
+
+        with torch.no_grad():
+            S_new = S_old + S_old * rate * h + model.diffusion(inputNN) * dW
+            S_new = torch.max(S_new, torch.zeros_like(S_new))  # absorption ensures positive stock price
+
+            V_new = V_old + model.driftV(inputNN) * h + model.diffusionV(inputNN) * (
+                    torch.sqrt(1 - torch.pow(model.rho(inputRho), 2)) * dW1 + model.rho(inputRho) * dW)
+            V_new = torch.max(V_new, torch.zeros_like(V_new))  # absorption ensures positive volatility
+
+            # print(model.driftV(inputNN))
+            # print(model.diffusionV(inputNN))
+            # print(model.rho(inputRho))
+
+        S_path[:, idx + 1] = np.squeeze(S_new.numpy())
+        S_old = S_new
+
+        V_path[:, idx + 1] = np.squeeze(V_new.numpy())
+        V_old = V_new
+
+    return S_path, V_path
 
 
 # Load market prices and set training target
@@ -356,63 +393,6 @@ for i in range(2, 102):
     print('--- MODEL TRAINING TIME: %d min %d s ---' % divmod(time.time() - train_time, 60))
     break
 
-
-def MC_paths(model, S0, V0, rate, timegrid, N=10):
-    h = timegrid[1] - timegrid[0]
-    S_old, V_old = torch.repeat_interleave(S0, N, dim=0), torch.repeat_interleave(V0, N, dim=0)
-    S_path, V_path = np.zeros((N, len(timegrid))), np.zeros((N, len(timegrid)))
-    S_path[:, 0], V_path[:, 0] = S0, V0
-
-    for idx, t in enumerate(timegrid[1:]):
-        dW, dW1 = torch.sqrt(h) * torch.randn((N, 1)), torch.sqrt(h) * torch.randn((N, 1))
-        input_time = torch.ones(N, 1) * t
-        inputNN = torch.cat([input_time, S_old.float(), V_old.float()], 1)
-        inputRho = torch.cat([input_time, dW, dW1], 1)
-
-        with torch.no_grad():
-            S_new = S_old + S_old * rate * h + model.diffusion(inputNN) * dW
-            S_new = torch.max(S_new, torch.zeros_like(S_new))  # absorption ensures positive stock price
-
-            V_new = V_old + model.driftV(inputNN) * h + model.diffusionV(inputNN) * (
-                    torch.sqrt(1 - torch.pow(model.rho(inputRho), 2)) * dW1 + model.rho(inputRho) * dW)
-            V_new = torch.max(V_new, torch.zeros_like(V_new))  # absorption ensures positive volatility
-
-            # print(model.driftV(inputNN))
-            # print(model.diffusionV(inputNN))
-            # print(model.rho(inputRho))
-
-        S_path[:, idx + 1] = np.squeeze(S_new.numpy())
-        S_old = S_new
-
-        V_path[:, idx + 1] = np.squeeze(V_new.numpy())
-        V_old = V_new
-
-    return S_path, V_path
-
-
-def plot_density(Z):
-    m = Z.mean()
-    var = Z.var()
-    pdf_x = np.linspace(np.min(Z), np.max(Z), 1000)
-    pdf_y = 1.0 / np.sqrt(2 * np.pi * var) * np.exp(-0.5 * (pdf_x - m) ** 2 / var)
-    plt.hist(Z, 100, density=True)
-    plt.plot(pdf_x, pdf_y, 'k--')
-
-
-def losses_reg(x, y):
-    slopes = []
-    intercepts = []
-    stds = []
-    for i in range(0, len(y), 50):
-        slope, intercept, r_value, p_value, std = stats.linregress(np.array(range(len(y[i:min(i + 50, len(y))]))),
-                                                                   y[i:min(i + 50, len(y))])
-        slopes.append(slope)
-        intercepts.append(intercept)
-        stds.append(std)
-    plt.plot(x, y)
-    for idx, (slope, intercept, std) in enumerate(zip(slopes, intercepts, stds)):
-        plt.plot(x[idx * 50: min(idx * 50 + 50, len(x))], x[idx * 50: min(idx * 50 + 50, len(x))] * slope + intercept)
-        print(idx * 50, min(idx * 50, len(x)))
 
 
 print('done')

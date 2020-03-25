@@ -114,17 +114,21 @@ if __name__ == "__main__":
     params = HestonParams()
     strikes_put = np.array([55, 60, 65, 70, 75, 80, 85, 90, 95, 100])
     strikes_call = np.array([100, 105, 110, 115, 120, 125, 130, 135, 140, 145])
+    strikes = np.concatenate([strikes_put, strikes_call])
     maturities = np.array([2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48])
-    S, V = Simulate_Heston_QuantLib(NumOfAssets=20000, TimeSteps=48, dt=48./(365*2))
+    # S, V = Simulate_Heston_QuantLib(NumOfAssets=60000, TimeSteps=48, dt=1./720)
     np.random.seed(1)
 
-    VIX2 = heston_VIX2(V, params.kappa, params.theta)
-    Fwd_price = heston_VIX_fwd(np.sqrt(VIX2))
+    # VIX2 = heston_VIX2(V, params.kappa, params.theta)
+    # Fwd_price = heston_VIX_fwd(np.sqrt(VIX2))
 
-    print(Fwd_price)
+    Fwd = np.zeros(len(maturities))
 
-    plt.plot(np.sqrt(VIX2[:, :10]), 'b-')
-    plt.plot(V[:, :10]*100, '--')
-    plt.show()
+    for idx, maturity in enumerate(maturities):
+        print(f'Calculating maturity: {maturity}')
+        S, V = Simulate_Heston_QuantLib(NumOfAssets=60000, TimeSteps=int(maturity*15), dt=1./720)
+        Fwd[idx] = heston_VIX_fwd(np.sqrt(heston_VIX2(V, params.kappa, params.theta)))
+
+    np.save('VIX_heston_forwards.npy', Fwd)
 
     print('end')
