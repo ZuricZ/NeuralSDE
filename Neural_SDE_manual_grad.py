@@ -3,6 +3,8 @@
 
 import torch
 import torch.nn as nn
+import torchviz
+# from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 # from backward_pass import backprop
 # from backward_pass import Optimizers
@@ -43,8 +45,8 @@ def log_time(func):
 
 
 class ModelParams:
-    def __init__(self, n_epochs=100, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=1000, test_size=20000,
-                 n_time_steps=48, S0=100, V0=0.04, rate=0.0, T=2):  # r = 0.025
+    def __init__(self, n_epochs=100, n_layers=2, vNetWidth=20, MC_samples=20000, batch_size0=5, test_size=20000,
+                 n_time_steps=5, S0=100, V0=0.04, rate=0.025, T=2):  # r = 0.025
         self.n_epochs = n_epochs
         self.n_layers = n_layers
         self.vNetWidth = vNetWidth
@@ -58,7 +60,8 @@ class ModelParams:
         self.strikes_put = [55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
         self.strikes_call = [100, 105, 110, 115, 120, 125, 130, 135, 140, 145]
         self.strikes = self.strikes_put + self.strikes_call
-        monthly_step = n_time_steps // 24  # we have 24 maturities worth of Heston option prices
+        # monthly_step = n_time_steps // 24  # we have 24 maturities worth of Heston option prices
+        monthly_step = 1
         self.maturities = [int(maturity) for maturity in range(monthly_step, n_time_steps + monthly_step, monthly_step)]
         self.S0 = S0
         self.V0 = V0
@@ -88,7 +91,8 @@ class NeuralNetCell(nn.Module):
 
     def init_weights(self, m):
         if type(m) == nn.Linear:
-            nn.init.normal_(m.weight, mean=0.0, std=0.05)  # for std > 0.1 paths quickly become singular
+            nn.init.xavier_normal_(m.weight, gain=0.5)
+            # nn.init.normal_(m.weight, mean=0.0, std=0.05)  # for std > 0.1 paths quickly become singular
             try:
                 m.bias.data.fill_(0.01)
             except:
@@ -155,6 +159,10 @@ class SDE_tools(ModelParams):
         ModelParams.__init__(self)
         # super(SDE_tools, self).__init__()
 
+    @staticmethod
+    def normalize_input(tensor):
+        return tensor - tensor.mean(0)
+
     @seed_decorator
     def generate_BMs(self, MC_samples, **kwargs):
         # create BM increments
@@ -185,6 +193,10 @@ class SDE_tools(ModelParams):
                 input_S = torch.cat([ones * t, S[:, idx, None], V[:, idx, None]], 1)
                 input_V = torch.cat([ones * t, V[:, idx, None]], 1)
 
+                # De-mean the input
+                # input_S = self.normalize_input(input_S)
+                # input_V = self.normalize_input(input_V)
+
                 # absorption ensures positive stock price
                 S[:, idx+1] = torch.max(S[:, idx] * (1 + self.rate * self.h) +
                                         model.diffusion(input_S).squeeze() * dW[:, idx], zeros.squeeze())
@@ -203,9 +215,6 @@ class SDE_tools(ModelParams):
             return S.detach(), V.detach()
         else:
             return S, V
-
-    def generate_VIX(self, V):
-        pass
 
     def calc_prices(self, S, detach_graph=False):
         price_call_mat = torch.zeros(len(self.maturities), len(self.strikes))
@@ -242,11 +251,6 @@ class Trainer(SDE_tools):
     def loss_func(self, C, C_mkt):
         return torch.mean(torch.pow(C - C_mkt, 2))
 
-    def loss_SPX_VIX(self, C, C_mkt, Fwd, Fwd_mkt):
-        # weighted loss of VIX Fwds and SPX options
-        N, M = len(self.maturities), len(self.strikes)
-        return ((N + M)*self.loss_func(C, C_mkt) + N*self.loss_func(Fwd, Fwd_mkt))/(2*N + M)
-
     @staticmethod
     @log_time
     def torch_backprop(loss):
@@ -263,14 +267,17 @@ class Trainer(SDE_tools):
         true_prices = torch.cat([C_mkt, P_mkt], 0)
         W_test = self.generate_BMs(self.test_size, seed=0)
 
-        plot_grads = utils.GradPlot()
+        # plot_grads = utils.GradPlot()
 
         for epoch in range(self.n_epochs):
             # evaluate and print test error at the start of each epoch
             S_test, V_test = self.generate_paths(self.model_train, W_test, no_grads=True, detach_graph=True)
-
             test_prices = self.calc_prices(S_test, detach_graph=True)
             loss_test = self.loss_func(test_prices, true_prices)
+
+            # plt.figure(2)
+            # plt.plot(S_test[:100, :].T)
+            # plt.show()
 
             batch_size = batch_func(False)
             print('--------------------------')
@@ -279,22 +286,27 @@ class Trainer(SDE_tools):
 
             # generate paths TODO: generate paths in the main()?
             BMs = self.generate_BMs(batch_size, seed=epoch)
-            S, V = self.generate_paths(self.model_train, BMs, no_grads=True, detach_graph=True)  # detach from graph/no graphs if running manual backprop else not
-            # prices = self.calc_prices(S)
-            # loss = self.loss_func(prices, true_prices)
+            S, V = self.generate_paths(self.model_train, BMs, no_grads=False, detach_graph=False)  # detach from graph/no graphs if running manual backprop else not
+            prices = self.calc_prices(S)
+            loss = self.loss_func(prices, true_prices)
+
+            print(model.diffusion.i_h[0].weight.grad)
+
+            torchviz.make_dot(loss).render("attached2", format="svg")
 
             self.optimizer.zero_grad()
-            # self.torch_backprop(loss)
-            # self.optimizer.step()
-            # self.scheduler_func.step()
+            self.torch_backprop(loss)
+            self.optimizer.step()
+            self.scheduler_func.step()
+
             # print('\t Train Loss={0:.4f}'.format(torch.sqrt(loss).item()))  # previous epoch loss in reality
             # plot_grads.replot_training(self.model_train.diffusion.h_h[0][0].weight.grad)
 
-            backward = backprop(self.model_train, S, V, BMs)
-            grad_dict = backward.loss_grad(C_mkt, P_mkt)
-            Optimizers.SGD(self.model_train, grad_dict)
+            # backward = backprop(self.model_train, S, V, BMs)
+            # grad_dict = backward.loss_grad(C_mkt, P_mkt)
+            # Optimizers.SGD(self.model_train, grad_dict)
 
-            plot_grads.replot_training(grad_dict['h_h.0.0.weight'])
+            # plot_grads.replot_training(grad_dict['h_h.0.0.weight'])
             # utils.GradPlot.plt_grads(grad_dict['h_h.0.0.weight'], f'grad in loop {epoch}')
 
         # return self.model_train
@@ -312,10 +324,12 @@ if __name__ == "__main__":
     C_mkt = torch.cat([ITM_call, OTM_call], 1)[:len(params.maturities), :]
     P_mkt = torch.cat([OTM_put, ITM_put], 1)[:len(params.maturities), :]
 
+    # writer = SummaryWriter()
     train_time = time.time()
     model = Net_SDE(dim=1, n_layers=params.n_layers, vNetWidth=params.vNetWidth)  # Model will be actually changed inplace
+    # writer.add_graph(model.diffusion)
     # utils.GradPlot.plt_grads(model.diffusion.h_h[0][0].weight, 'weight')
-    tools = SDE_tools()
+    # tools = SDE_tools()
     # print(f'Out: {id(model)}')
     trainer = Trainer(model)
     trainer.train_models(C_mkt, P_mkt)

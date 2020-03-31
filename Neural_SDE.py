@@ -110,13 +110,14 @@ class Net_SDE(nn.Module):
         self.device = device
         self.strikes_call = strikes_call
         self.strikes_put = strikes_put
+        self.strikes = strikes_put + strikes_call
 
         # Input to each coefficient (NN) will be (t,S_t,V_t)
         # We restrict diffusion coefficients to be positive
         self.diffusion = Net_timestep(dim=dim + 2, nOut=1, n_layers=n_layers, vNetWidth=vNetWidth, act_output='softp')
-        self.diffusionV = Net_timestep(dim=dim + 2, nOut=1, n_layers=n_layers, vNetWidth=vNetWidth, act_output='softp')
-        self.driftV = Net_timestep(dim=dim + 2, nOut=1, n_layers=n_layers, vNetWidth=vNetWidth)
-        self.rho = Net_timestep(dim=dim + 2, nOut=1, n_layers=n_layers, vNetWidth=5, act_output='tanh')
+        self.diffusionV = Net_timestep(dim=dim + 1, nOut=1, n_layers=n_layers, vNetWidth=vNetWidth, act_output='softp')
+        self.driftV = Net_timestep(dim=dim + 1, nOut=1, n_layers=n_layers, vNetWidth=vNetWidth)
+        self.rho = Net_timestep(dim=dim + 0, nOut=1, n_layers=n_layers, vNetWidth=5, act_output='tanh')
 
     def forward(self, S0, V0, rate, indices, z, z1):
         MC_samples = z.shape[0]
@@ -136,78 +137,92 @@ class Net_SDE(nn.Module):
         n_steps = len(self.timegrid) - 1
 
         # Solve for S_t, V_t (Euler)
-        for i in range(1, len(self.timegrid)):
-            dW = (torch.sqrt(h) * z[:, i - 1]).reshape(MC_samples, 1)
-            dW1 = (torch.sqrt(h) * z1[:, i - 1]).reshape(MC_samples, 1)
-            input_time = ones * self.timegrid[i - 1]
-            inputNN = torch.cat([input_time, S_old, V_old], 1)
-            inputRho = torch.cat([input_time, dW, dW1], 1)
+        # for i in range(1, len(self.timegrid)):
+        #     dW = (torch.sqrt(h) * z[:, i - 1]).reshape(MC_samples, 1)
+        #     dW1 = (torch.sqrt(h) * z1[:, i - 1]).reshape(MC_samples, 1)
+        #     input_time = ones * self.timegrid[i - 1]
+        #     input_S = torch.cat([input_time, S_old, V_old], 1)
+        #     input_V = input_S[:, [0, 2]]
+        #
+        #     S_new = S_old + S_old * rate * h + self.diffusion(input_S) * dW
+        #     S_old = torch.max(S_new, zeros)  # absorption ensures positive stock price
+        #
+        #     V_new = V_old + self.driftV(input_V) * h + self.diffusionV(input_V) * (
+        #             torch.sqrt(1 - torch.pow(self.rho(input_time), 2)) * dW1 + self.rho(input_time) * dW)
+        #     V_old = torch.max(V_new, zeros)  # absorption ensures positive volatility
+        #
+        #     # with torch.no_grad():
+        #         # print(self.driftV(inputNN))
+        #         # print(self.diffusionV(inputNN))
+        #         # print(self.rho(inputRho))
+        #
+        #     discount_factor = torch.exp(-rate * 2 * i / n_steps)
+        #
+        #     # If particular timestep is a maturity for Vanilla option
+        #     if i in indices:
+        #         price_call_OTM_vec, price_put_OTM_vec = torch.zeros(len(K_call), 1), torch.zeros(len(K_put), 1)
+        #         price_call_ITM_vec, price_put_ITM_vec = torch.zeros(len(K_put), 1), torch.zeros(len(K_call), 1)
+        #
+        #         # Evaluate put (OTM/ITM) and call (OTM/ITM) option prices
+        #         for idx, (strike, strike_put) in enumerate(itertools.zip_longest(K_call, K_put, fillvalue=np.nan)):
+        #             strike_tensor = torch.ones(MC_samples, 1) * strike
+        #             strike_put_tensor = torch.ones(MC_samples, 1) * strike_put
+        #
+        #             # avoid creating new variables (RAM usage)
+        #             price_call_OTM_vec[idx], price_put_OTM_vec[idx] = \
+        #                 (call_payoff(S_old, strike_tensor) * discount_factor).mean(), \
+        #                 (put_payoff(S_old, strike_put_tensor) * discount_factor).mean()
+        #             price_call_ITM_vec[idx], price_put_ITM_vec[idx] = \
+        #                 (call_payoff(S_old, strike_put_tensor) * discount_factor).mean(), \
+        #                 (put_payoff(S_old, strike_tensor) * discount_factor).mean()
+        #
+        #         price_call_OTM_mat = torch.cat([price_call_OTM_mat, price_call_OTM_vec.T], 0)  # call OTM
+        #         price_put_OTM_mat = torch.cat([price_put_OTM_mat, price_put_OTM_vec.T], 0)  # put OTM
+        #
+        #         price_call_ITM_mat = torch.cat([price_call_ITM_mat, price_call_ITM_vec.T], 0)  # call ITM
+        #         price_put_ITM_mat = torch.cat([price_put_ITM_mat, price_put_ITM_vec.T], 0)  # put ITM
 
-            S_new = S_old + S_old * rate * h + self.diffusion(inputNN) * dW
-            S_old = torch.max(S_new, zeros)  # absorption ensures positive stock price
+        dW, dB = torch.sqrt(h) * z, torch.sqrt(h) * z1
+        zeros, ones = torch.zeros(dW.shape[0], 1), torch.ones(dW.shape[0], 1)
 
-            V_new = V_old + self.driftV(inputNN) * h + self.diffusionV(inputNN) * (
-                    torch.sqrt(1 - torch.pow(self.rho(inputRho), 2)) * dW1 + self.rho(inputRho) * dW)
-            V_old = torch.max(V_new, zeros)  # absorption ensures positive volatility
+        S_t, V_t = ones * S0, ones * V0
 
-            # with torch.no_grad():
-                # print(self.driftV(inputNN))
-                # print(self.diffusionV(inputNN))
-                # print(self.rho(inputRho))
+        price_call_mat = torch.zeros(len(indices), len(self.strikes))
+        price_put_mat = torch.zeros(len(indices), len(self.strikes))
 
-            discount_factor = torch.exp(-rate * 2 * i / n_steps)
+        discount_factor = lambda t: torch.exp(-rate * t)
 
-            # If particular timestep is a maturity for Vanilla option
-            if i in indices:
-                price_call_OTM_vec, price_put_OTM_vec = torch.zeros(len(K_call), 1), torch.zeros(len(K_put), 1)
-                price_call_ITM_vec, price_put_ITM_vec = torch.zeros(len(K_put), 1), torch.zeros(len(K_call), 1)
+        # Euler-Maruyama S_t, V_t
+        for idx, t in enumerate(self.timegrid[:-1], 1):
+            # S_t, V_t = self.tools.generate_path_step(self, (dW[:, idx], dB[:, idx]), (S_t, V_t), t)
 
-                # Evaluate put (OTM/ITM) and call (OTM/ITM) option prices
-                for idx, (strike, strike_put) in enumerate(itertools.zip_longest(K_call, K_put, fillvalue=np.nan)):
-                    strike_tensor = torch.ones(MC_samples, 1) * strike
-                    strike_put_tensor = torch.ones(MC_samples, 1) * strike_put
+            input_S = torch.cat([ones * t, S_t, V_t], 1)
+            input_V = input_S[:, [0, 2]]
 
-                    # avoid creating new variables (RAM usage)
-                    price_call_OTM_vec[idx], price_put_OTM_vec[idx] = \
-                        (call_payoff(S_old, strike_tensor) * discount_factor).mean(), \
-                        (put_payoff(S_old, strike_put_tensor) * discount_factor).mean()
-                    price_call_ITM_vec[idx], price_put_ITM_vec[idx] = \
-                        (call_payoff(S_old, strike_put_tensor) * discount_factor).mean(), \
-                        (put_payoff(S_old, strike_tensor) * discount_factor).mean()
+            # absorption ensures positive stock price
+            S_new = S_t * (1 + rate * h) + self.diffusion(input_S) * dW[:, idx-1, None]
+            S_t = torch.max(S_new, zeros)
 
-                price_call_OTM_mat = torch.cat([price_call_OTM_mat, price_call_OTM_vec.T], 0)  # call OTM
-                price_put_OTM_mat = torch.cat([price_put_OTM_mat, price_put_OTM_vec.T], 0)  # put OTM
+            V_new = V_t + self.driftV(input_V) * h + self.diffusionV(input_V) * (
+                    torch.sqrt(1 - torch.pow(self.rho(ones * t), 2)) * dB[:, idx-1, None]
+                    + self.rho(ones * t) * dW[:, idx-1, None])
+            V_t = torch.max(V_new, zeros)
 
-                price_call_ITM_mat = torch.cat([price_call_ITM_mat, price_call_ITM_vec.T], 0)  # call ITM
-                price_put_ITM_mat = torch.cat([price_put_ITM_mat, price_put_ITM_vec.T], 0)  # put ITM
+            if idx in indices:
+                # price_call_mat[idx, :], price_put_mat[idx, :] = self.tools.calc_prices(S_t, mat=t)
+                idx_t = indices.tolist().index(idx)
+                for idx_k, strike in enumerate(self.strikes):
+                    price_call_mat[idx_t, idx_k] = (torch.max(S_t - strike, torch.zeros_like(S_t)) *
+                                                    discount_factor(t)).mean()
+                    price_put_mat[idx_t, idx_k] = (torch.max(strike - S_t, torch.zeros_like(S_t)) *
+                                                   discount_factor(t)).mean()
 
+        price_call_OTM_mat = price_call_mat[:, 10:]
+        price_call_ITM_mat = price_call_mat[:, :10]
+        price_put_OTM_mat = price_put_mat[:, :10]
+        price_put_ITM_mat = price_put_mat[:, 10:]
         # Return model implied vanilla option prices
         return torch.cat([price_call_OTM_mat, price_put_OTM_mat, price_call_ITM_mat, price_put_ITM_mat], 0)
-
-
-# def price_options(i, S_old, strike_tensor, strike_put_tensor): # TODO: adapt to handle NaN (different lens of strikes)
-#     zeros = torch.zeros_like(S_old)
-#     # Since we use the same number of maturities for vanilla calls and puts:
-#     payoff_call_OTM = torch.max(S_old - strike_tensor, zeros)  # call OTM
-#     payoff_put_OTM = torch.max(strike_put_tensor - S_old, zeros)  # put OTM
-#
-#     payoff_call_ITM = torch.max(S_old - strike_put_tensor, zeros)  # call ITM
-#     payoff_put_ITM = torch.max(strike_tensor - S_old, zeros)  # put ITM
-#
-#     # Discounting assumes we use 2-year time horizon
-#     discounted_payoff_call_OTM = payoff_call_OTM * torch.exp(-rate * 2 * i / n_steps)
-#     discounted_payoff_put_OTM = payoff_put_OTM * torch.exp(-rate * 2 * i / n_steps)
-#
-#     discounted_payoff_call_ITM = payoff_call_ITM * torch.exp(-rate * 2 * i / n_steps)
-#     discounted_payoff_put_ITM = payoff_put_ITM * torch.exp(-rate * 2 * i / n_steps)
-#
-#     # Calculate price via MC
-#     price_call_OTM = discounted_payoff_call_OTM.mean()
-#     price_put_OTM = discounted_payoff_put_OTM.mean()
-#
-#     price_call_ITM = discounted_payoff_call_ITM.mean()
-#     price_put_ITM = discounted_payoff_put_ITM.mean()
-#     return price_call_OTM, price_put_OTM, price_call_ITM, price_put_ITM
 
 
 def train_models(seedused):
@@ -219,7 +234,6 @@ def train_models(seedused):
                     OTM_call=OTM_call, ITM_put=ITM_put, OTM_put=OTM_put, n_layers=2, vNetWidth=20, device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, eps=1e-08, amsgrad=True, betas=(0.9, 0.999),
                                  weight_decay=0)
-
 
     # optimizer= torch.optim.Rprop(model.parameters(), lr=0.001, etas=(0.5, 1.2), step_sizes=(1e-07, 1))
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 200], gamma=0.1)
@@ -332,15 +346,15 @@ def MC_paths(model, S0, V0, rate, timegrid, N=10):
     for idx, t in enumerate(timegrid[1:]):
         dW, dW1 = torch.sqrt(h) * torch.randn((N, 1)), torch.sqrt(h) * torch.randn((N, 1))
         input_time = torch.ones(N, 1) * t
-        inputNN = torch.cat([input_time, S_old.float(), V_old.float()], 1)
-        inputRho = torch.cat([input_time, dW, dW1], 1)
+        input_S = torch.cat([input_time, S_old.float(), V_old.float()], 1)
+        input_V = input_S[:, [0, 2]]
 
         with torch.no_grad():
-            S_new = S_old + S_old * rate * h + model.diffusion(inputNN) * dW
+            S_new = S_old + S_old * rate * h + model.diffusion(input_S) * dW
             S_new = torch.max(S_new, torch.zeros_like(S_new))  # absorption ensures positive stock price
 
-            V_new = V_old + model.driftV(inputNN) * h + model.diffusionV(inputNN) * (
-                    torch.sqrt(1 - torch.pow(model.rho(inputRho), 2)) * dW1 + model.rho(inputRho) * dW)
+            V_new = V_old + model.driftV(input_V) * h + model.diffusionV(input_V) * (
+                    torch.sqrt(1 - torch.pow(model.rho(input_time), 2)) * dW1 + model.rho(input_time) * dW)
             V_new = torch.max(V_new, torch.zeros_like(V_new))  # absorption ensures positive volatility
 
             # print(model.driftV(inputNN))
