@@ -16,11 +16,35 @@ import itertools
 import math
 import os
 
+torch.autograd.set_detect_anomaly(True)
+
+
+def seed_decorator(func):
+    def set_seed(*args, **kwargs):
+        if 'seed' in kwargs.keys():
+            torch.manual_seed(kwargs['seed'])
+
+        func(*args, **kwargs)
+
+        if 'seed' in kwargs.keys():
+            torch.manual_seed(torch.seed())
+        return func(*args, **kwargs)
+    return set_seed
+
+
+def log_time(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        retval = func(*args, **kwargs)
+        end_time = time.time()
+        print("\t Elapsed time: %.2f" % (end_time - start_time))
+        return retval
+    return wrapper
+
 
 class ModelParams:
-
-    def __init__(self, n_epochs=10, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=20000, test_size=20000,
-                 n_time_steps=96, S0=100, V0=0.04, rate=0.025, T=2):  # r = 0.025
+    def __init__(self, n_epochs=100, n_layers=2, vNetWidth=20, MC_samples=20000, batch_size0=10000, test_size=20000,
+                 n_time_steps=48, S0=100, V0=0.04, rate=0.025, T=2):  # r = 0.025
         self.n_epochs = n_epochs
         self.n_layers = n_layers
         self.vNetWidth = vNetWidth
@@ -42,54 +66,40 @@ class ModelParams:
 
 
 class NeuralNetCell(nn.Module):
-
     def __init__(self, dim, nOut, n_layers, vNetWidth, activation="relu", act_output='none'):
         super(NeuralNetCell, self).__init__()
         self.dim = dim
         self.nOut = nOut
+        self.relu_activation = nn.ReLU()
+        self.tanh_activation = nn.Tanh()
+        self.elu_activation = nn.ELU()
+        self.softp_activation = nn.Softplus()
 
         if activation not in {'relu', 'tanh'}:
-            raise ValueError("Unknown activation function {}".format(activation))
+            raise ValueError("unknown activation function {}".format(activation))
         elif activation == "relu":
-            self.activation = nn.ReLU()
+            self.activation = self.relu_activation
         else:
-            self.activation = nn.Tanh()
+            self.activation = self.tanh_activation
 
-        if act_output not in {'relu', 'tanh', 'elu', 'softp', 'none'}:
-            raise ValueError("Unknown activation function {}".format(act_output))
-        elif act_output == 'relu':
-            self.out_activation = nn.ReLU()
-        elif act_output == 'elu':
-            self.out_activation = nn.ELU()
-        elif act_output == 'softp':
-            self.out_activation = nn.Softplus()
-        elif act_output == 'tanh':
-            self.out_activation = nn.Tanh()
-        else:
-            self.out_activation = nn.Identity()
-
-        self.i_h = self.inputLayer(dim, vNetWidth)
+        self.i_h = self.hiddenLayerT1(dim, vNetWidth)
         self.h_h = nn.ModuleList([self.hiddenLayerT1(vNetWidth, vNetWidth) for l in range(n_layers - 1)])
-        self.h_o = self.outputLayer(vNetWidth, nOut, act='none')
+        self.h_o = self.outputLayer(vNetWidth, nOut, act=act_output)
 
-    @staticmethod
-    def init_weights(m):
+    def init_weights(self, m):
         if type(m) == nn.Linear:
             # nn.init.xavier_normal_(m.weight, gain=0.5)
-            nn.init.normal_(m.weight, mean=0.0, std=0.1)
+            nn.init.normal_(m.weight, mean=0.0, std=0.1)  # for std > 0.1 paths quickly become singular
             try:
                 m.bias.data.fill_(0.01)
             except:
                 pass
 
-    @staticmethod
-    def normalize_input(tensor):
-        return tensor - tensor.mean(dim=0)
-
-    def inputLayer(self, nIn, nOut):
-        layer = nn.Sequential(nn.Linear(nIn, nOut, bias=True),
-                              # nn.BatchNorm1d(nOut, momentum=0.1),
-                              self.activation)
+    def hiddenLayerT0(self, nIn, nOut):
+        layer = nn.Sequential(  # nn.BatchNorm1d(nIn, momentum=0.1),
+            nn.Linear(nIn, nOut, bias=True),
+            # nn.BatchNorm1d(nOut, momentum=0.1),
+            self.activation)
         layer.apply(self.init_weights)
         return layer
 
@@ -103,28 +113,33 @@ class NeuralNetCell(nn.Module):
     def outputLayer(self, nIn, nOut, act='none'):
         if act == 'none':
             layer = nn.Sequential(nn.Linear(nIn, nOut, bias=False))
+        elif act == 'relu':
+            layer = nn.Sequential(nn.Linear(nIn, nOut, bias=False), self.relu_activation)
+        elif act == 'elu':
+            layer = nn.Sequential(nn.Linear(nIn, nOut, bias=False), self.elu_activation)
+        elif act == 'softp':
+            layer = nn.Sequential(nn.Linear(nIn, nOut, bias=False), self.softp_activation)
+        elif act == 'tanh':
+            layer = nn.Sequential(nn.Linear(nIn, nOut, bias=False), self.tanh_activation)
         else:
-            layer = nn.Sequential(nn.Linear(nIn, nOut, bias=False), self.out_activation)
+            raise ValueError('Wrong activation.')
         layer.apply(self.init_weights)
         return layer
 
     def forward(self, S):
-        S = self.normalize_input(S)  # normalize the input
         h = self.i_h(S)
         for l in range(len(list(self.h_h))):
             h = list(self.h_h)[l](h)
-        output = self.out_activation(self.h_o(h) + S.sum(dim=1, keepdim=True))  # skip connection
-        # nn.ConstantPad1d((0, 20 - 3), 0)(S).shape
+        output = self.h_o(h)
         return output
 
 
 # Set up neural SDE class
 class Net_SDE(nn.Module):
-
     def __init__(self, params):
         super(Net_SDE, self).__init__()
         self.params = params
-        # self.tools = SDE_tools(params)
+        self.tools = SDE_tools(params)
         # Input to coefficient (NN) will be (t,S_t,V_t)
         self.diffusion = NeuralNetCell(dim=3, nOut=1, n_layers=params.n_layers, vNetWidth=params.vNetWidth,
                                        act_output='softp')  # We restrict diffusion coefficients to be positive
@@ -133,12 +148,10 @@ class Net_SDE(nn.Module):
                                         act_output='softp')  # We restrict diffusion coefficients to be positive
         self.driftV = NeuralNetCell(dim=2, nOut=1, n_layers=params.n_layers, vNetWidth=params.vNetWidth)
         # Input to each coefficient (NN) will be (t)
-        self.rho = NeuralNetCell(dim=1, nOut=1, n_layers=1, vNetWidth=2,
+        self.rho = NeuralNetCell(dim=1, nOut=1, n_layers=2, vNetWidth=5,
                                  act_output='tanh')  # restrict rho to [-1,1]
 
-    def forward(self, W, scheme='reflection'):
-        if scheme not in {'absorption', 'reflection'}:
-            raise ValueError('Wrong discretization scheme.')
+    def forward(self, W):
         dW, dB = W
         zeros, ones = torch.zeros(dW.shape[0], 1), torch.ones(dW.shape[0], 1)
 
@@ -146,8 +159,6 @@ class Net_SDE(nn.Module):
 
         price_call_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes))
         price_put_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes))
-
-        Fwd_var_vec = torch.zeros(len(self.params.maturities))
 
         discount_factor = lambda t: torch.exp(-self.params.rate * t)
 
@@ -165,45 +176,18 @@ class Net_SDE(nn.Module):
             V_new = V_t + self.driftV(input_V) * self.params.h + self.diffusionV(input_V) * (
                     torch.sqrt(1 - torch.pow(self.rho(ones * t), 2)) * dB[:, idx-1, None]
                     + self.rho(ones * t) * dW[:, idx-1, None])
-            V_t = torch.max(V_new, zeros) if scheme == 'absorption' else torch.abs(V_new)
+            V_t = torch.max(V_new, zeros)
 
-            if idx in self.params.maturities:
+            if idx in self.params.maturities:  # TODO: check how many times idx is called
                 # price_call_mat[idx, :], price_put_mat[idx, :] = self.tools.calc_prices(S_t, mat=t)
                 idx_t = self.params.maturities.index(idx)
                 for idx_k, strike in enumerate(self.params.strikes):
                     price_call_mat[idx_t, idx_k] = (torch.max(S_t - strike, torch.zeros_like(S_t)) *
-                                                    discount_factor(t)).mean()
+                                              discount_factor(t)).mean()
                     price_put_mat[idx_t, idx_k] = (torch.max(strike - S_t, torch.zeros_like(S_t)) *
-                                                   discount_factor(t)).mean()
+                                             discount_factor(t)).mean()
 
-                Fwd_var_vec[idx_t] = V_t.mean()  # no discounting for now, whats the Q measure?
-
-        return torch.cat([price_call_mat, price_put_mat], 0), Fwd_var_vec
-
-
-def seed_decorator(func):
-    def set_seed(*args, **kwargs):
-        if 'seed' in kwargs.keys():
-            torch.manual_seed(kwargs['seed'])
-
-        func(*args, **kwargs)
-
-        if 'seed' in kwargs.keys():
-            torch.manual_seed(torch.seed())
-        return func(*args, **kwargs)
-
-    return set_seed
-
-
-def log_time(func):
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        retval = func(*args, **kwargs)
-        end_time = time.time()
-        print('Elapsed time: {:.2f}'.format(end_time - start_time), end='')
-        return retval
-
-    return wrapper
+        return torch.cat([price_call_mat, price_put_mat], 0)
 
 
 class SDE_tools:
@@ -212,17 +196,41 @@ class SDE_tools:
         self.params = params
         # ModelParams.__init__(self)
 
+    @staticmethod
+    def normalize_input(tensor):
+        return tensor - tensor.mean(0)
+
     @seed_decorator
-    def generate_BMs(self, MC_samples, antithetics=False, **kwargs):
+    def generate_BMs(self, MC_samples, **kwargs):
         # create BM increments
         dW = torch.sqrt(self.params.h) * torch.randn((MC_samples, len(self.params.time_grid)))
         dB = torch.sqrt(self.params.h) * torch.randn((MC_samples, len(self.params.time_grid)))
-        if antithetics:
-            return torch.cat([dW, -dW], 0), torch.cat([dB, -dB], 0)
-        else:
-            return dW, dB
 
-    def generate_paths(self, model, W, scheme='reflection', detach_graph=False, no_grads=False):
+        return dW, dB
+
+    def generate_path_step(self, model, W_t, X_t, t, scheme='absorption'):
+        if scheme not in {'absorption', 'reflection'}:
+            raise ValueError('Wrong discretization scheme.')
+
+        dW_t, dB_t = W_t[0].view(-1, 1), W_t[1].view(-1, 1)
+        S_old, V_old = X_t[0].view(-1, 1), X_t[1].view(-1, 1)
+
+        zeros, ones = torch.zeros(len(dW_t), 1), torch.ones(len(dW_t), 1)
+
+        input_S = torch.cat([ones * t, S_old, V_old], 1)
+        input_V = input_S[:, [0, 2]]
+
+        # absorption ensures positive stock price
+        S_new = torch.max(S_old * (1 + self.params.rate * self.params.h) + model.diffusion(input_S) * dW_t, zeros)
+
+        V_temp = V_old + model.driftV(input_V) * self.params.h + model.diffusionV(input_V) * (
+                torch.sqrt(1 - torch.pow(model.rho(ones * t), 2)) * dB_t
+                + model.rho(ones * t) * dW_t)
+        V_new = torch.max(V_temp, zeros) if scheme == 'absorption' else torch.abs(V_temp)
+
+        return S_new, V_new
+
+    def generate_paths(self, model, W, scheme='absorption', detach_graph=False, no_grads=False):
         if scheme not in {'absorption', 'reflection'}:
             # absorption ensures positive volatility
             raise ValueError('Wrong discretization scheme.')
@@ -241,6 +249,10 @@ class SDE_tools:
                 input_S = torch.cat([ones * t, S[:, idx, None], V[:, idx, None]], 1)
                 input_V = torch.cat([ones * t, V[:, idx, None]], 1)
 
+                # De-mean the input
+                # input_S = self.normalize_input(input_S)
+                # input_V = self.normalize_input(input_V)
+
                 # absorption ensures positive stock price
                 S[:, idx+1] = torch.max(S[:, idx] * (1 + self.params.rate * self.params.h) +
                                         model.diffusion(input_S).squeeze() * dW[:, idx], zeros.squeeze())
@@ -249,7 +261,7 @@ class SDE_tools:
                         torch.sqrt(1 - torch.pow(model.rho(ones * t), 2)) * dB[:, idx, None]
                         + model.rho(ones * t) * dW[:, idx, None])
                 V[:, idx+1] = torch.max(V_temp.squeeze(), zeros.squeeze()) \
-                    if scheme == 'absorption' else torch.abs(V_temp.squeeze())
+                    if scheme == 'absorption' else torch.abs(V_temp)
 
                 # print(self.driftV(input_V))
                 # print(self.diffusionV(input_V))
@@ -260,11 +272,8 @@ class SDE_tools:
         else:
             return S, V
 
-    def true_fwd_var(self, maturity):
-        """Generates Forward variance under Heston with params V_0 = 0.04, kappa = 1.5, theta = 0.04"""
-        kappa = 1.5
-        theta = self.params.V0
-        return self.params.V0*torch.exp(-kappa*maturity) + theta*(1. - torch.exp(-kappa*maturity))
+    def generate_VIX(self, V):
+        pass
 
     def calc_prices(self, S, mat=None, no_grads=False):
         discount_factor = lambda t: torch.exp(-self.params.rate * t)
@@ -293,7 +302,6 @@ class SDE_tools:
 
 
 class Trainer:
-
     def __init__(self, params, learning_rate=0.05, milestones=None, gamma=0.1):
         # super(Trainer, self).__init__()
         if milestones is None:
@@ -302,6 +310,14 @@ class Trainer:
         self.params = params
         self.tools = SDE_tools(params)
         self.learning_rate = learning_rate
+
+    def loss_func(self, C, C_mkt):
+        return torch.mean(torch.pow(C - C_mkt, 2))
+
+    def loss_SPX_VIX(self, C, C_mkt, Fwd, Fwd_mkt):
+        # weighted loss of VIX Fwds and SPX options
+        N, M = len(self.params.maturities), len(self.params.strikes)
+        return ((N + M)*self.loss_func(C, C_mkt) + N*self.loss_func(Fwd, Fwd_mkt))/(2*N + M)
 
     @staticmethod
     @log_time
@@ -313,95 +329,73 @@ class Trainer:
     def torch_forward(model_train, BMs):
         return model_train(BMs)
 
-    def loss_func(self, C, C_mkt):
-        return torch.mean(torch.pow(C - C_mkt, 2))
-
-    def loss_SPX_fwd(self, C, C_mkt, Fwd, Fwd_mkt, lam=1):
-        # weighted loss of Forward variances and SPX options
-        N, M = len(self.params.maturities), len(self.params.strikes)
-        C_loss, Fwd_loss = self.loss_func(C, C_mkt), self.loss_func(Fwd, Fwd_mkt)
-        return ((N + M)*C_loss + lam*N*Fwd_loss)/(2*N + M)  # normalize by batch size?
-
     def batch_func(self, loss):
         # Batch size as a function of upper bound on MC error
-        beta = 0.0015
         if loss:
-            return int(np.minimum(self.params.batch_size0, 2.576 ** 2 / (4 * beta ** 2 * np.power(loss, 2))))
+            return int(np.minimum(self.params.batch_size0, 2.576 ** 2 / (4 * 0.01 ** 2 * np.power(loss, 2)))) + 1000
         else:
             return self.params.batch_size0
 
-    def train_models(self, true_prices, true_fwd_var):
+    def train_models(self, true_prices):
+        W_test = self.tools.generate_BMs(self.params.test_size, seed=0)
 
-        model = Net_SDE(self.params)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01, eps=1e-08, amsgrad=True, betas=(0.9, 0.999),
-                                     weight_decay=0)
+        model = Net_SDE(params)
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate, eps=1e-08, amsgrad=True,
+                                          betas=(0.9, 0.999), weight_decay=0)
         # optimizer= torch.optim.Rprop(model.parameters(), lr=0.001, etas=(0.5, 1.2), step_sizes=(1e-07, 1))
+        # self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=milestones, gamma=gamma)
+        scheduler_func = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 0.985 ** epoch)
 
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3, 7], gamma=0.1)
-        # scheduler_func = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 0.985 ** epoch)
-        loss_bool = False
-        # loss_lambda = lambda i_epoch: 10.*np.power(i_epoch/self.params.n_epochs + 1, -4) + 0.5  # 10*(x+1)^(-4) + 0.5
-        loss_lambda = lambda i_epoch: 1
-
-        # fix the seeds for reproducibility and generate antithetics and pass to torch
-        W_test = self.tools.generate_BMs(self.params.test_size, antithetics=True, seed=0)
-        W = self.tools.generate_BMs(self.params.MC_samples, antithetics=True, seed=1)
+        # plot_grads = utils.GradPlot()
 
         for epoch in range(self.params.n_epochs):
+            print('--------------------------')
+            print('Epoch: {}'.format(epoch))
             # evaluate and print test error at the start of each epoch
-            with torch.no_grad():
-                model.eval()  # turn off Batch Normalization
-                test_prices, test_fwd_var = model(W_test)
-                # test_loss = self.loss_func(test_prices, true_prices)
-                test_loss = self.loss_SPX_fwd(test_prices, true_prices, test_fwd_var, true_fwd_var, loss_lambda(epoch))
-                opt_test_loss, fwd_test_loss = self.loss_func(test_prices, true_prices), self.loss_func(test_fwd_var, true_fwd_var)
-
             # S_test, V_test = self.tools.generate_paths(model, W_test, no_grads=True, detach_graph=True)
-            # test_prices = self.tools.calc_prices(S_test)
-            # test_loss = self.loss_func(test_prices, target)
+            # test_prices = self.tools.calc_prices(S_test, no_grads=True)
 
-            batch = 0
-            batch_size = self.batch_func(opt_test_loss)
+            print('Test:\t\t', end='')
+            with torch.no_grad():
+                test_prices = self.torch_forward(model, W_test)
+                loss_test = self.loss_func(test_prices, true_prices).item()
+            # plt.figure(2)
+            # plt.plot(S_test[:100, :].T)
+            # plt.show()
 
-            print('------------------------------------------------------------------------------')
-            print('Epoch: {} ~ Batch size: {}'.format(epoch, batch_size))
-            print('\tTest weighted MSE loss = {0:.4f}'.format(test_loss.item()))
-            print('\tSPX option loss = {0:.6f}, Forward volatility loss = {1:.6f}'.format(opt_test_loss, fwd_test_loss))
+            batch_size = self.batch_func(False)
 
-            while batch < W[0].shape[0]:
-                timestart = time.time()
-                W_batch = W[0][batch: min(batch+batch_size, W[0].shape[0]), :], \
-                          W[1][batch: min(batch+batch_size, W[0].shape[0]), :]
+            print('\t Test Loss = *{0:.4f}* ~ Batch size for train: {1}'.format(loss_test, batch_size))
 
-                model.train()
-                optimizer.zero_grad()
+            # generate paths TODO: generate paths in the main()?
+            BMs = self.tools.generate_BMs(batch_size, seed=epoch)
 
-                print('\t\tForward pass ', end='')
-                train_prices, train_fwd_var = self.torch_forward(model, W_batch)
-                # loss = self.loss_func(train_prices, true_prices)
-                loss = self.loss_SPX_fwd(train_prices, true_prices, train_fwd_var, true_fwd_var, loss_lambda(epoch))
-                with torch.no_grad():
-                    opt_loss = self.loss_func(train_prices, true_prices).detach()
+            # forward pass
+            print('Forward pass: ', end='')
+            model_prices = self.torch_forward(model, BMs)  # time it
+            loss = self.loss_func(model_prices, true_prices)
 
-                print(' || Backward pass ', end='')
-                self.torch_backprop(loss)
-                optimizer.step()
-                print('\n\t\tMSE loss = {0:.4f}'.format(loss.item()), end='')
-                print('\t\t\t\t|| Total Time: {0:.2f}s & Batch size: {1}'.format(time.time() - timestart, batch_size))
+            # backward pass
+            print('Backward pass: ', end='')
+            optimizer.zero_grad()
+            self.torch_backprop(loss)  # time it
 
-                # utils.plt_grads(model.diffusionV.h_h[0][0].weight.grad)
-                # scheduler_func.step()
-                batch += batch_size
-                batch_size = self.batch_func(opt_loss)
+            optimizer.step()
+            scheduler_func.step()
 
-        scheduler.step()
+            # print('\t Train Loss={0:.4f}'.format(torch.sqrt(loss).item()))  # previous epoch loss in reality
+            # plot_grads.replot_training(self.model_train.diffusion.h_h[0][0].weight.grad)
+
+            # plot_grads.replot_training(grad_dict['h_h.0.0.weight'])
+            # utils.GradPlot.plt_grads(grad_dict['h_h.0.0.weight'], f'grad in loop {epoch}')
+
         return model
 
 
 if __name__ == "__main__":
     torch.manual_seed(1)
     params = ModelParams()
-    start_time = time.time()
     timegrid = params.time_grid
     # Load market prices and set training target
     ITM_call = torch.load('ITM_call.pt')
@@ -410,18 +404,18 @@ if __name__ == "__main__":
     OTM_put = torch.load('OTM_put.pt')
     C_mkt = torch.cat([ITM_call, OTM_call], 1)[:len(params.maturities), :]
     P_mkt = torch.cat([OTM_put, ITM_put], 1)[:len(params.maturities), :]
-    target = torch.cat([C_mkt, P_mkt], 0)
 
-    # all equal to V_0 since V_0 = theta
-    Fwd_var_mkt = SDE_tools(params).true_fwd_var(params.time_grid[params.maturities])
+    # writer = SummaryWriter()
+    train_time = time.time()
+    # writer.add_graph(model.diffusion)
+    # utils.GradPlot.plt_grads(model.diffusion.h_h[0][0].weight, 'weight')
+    tools = SDE_tools(params)
+    trainer = Trainer(params)
+    model = trainer.train_models(torch.cat([C_mkt, P_mkt], 0))
 
-    model = Trainer(params).train_models(target, Fwd_var_mkt)  # TODO: rho becomes positive
-    print('--- MODEL TRAINING TIME: %d min %d s ---' % divmod(time.time() - start_time, 60))
-    S, V = SDE_tools(params).generate_paths(model, SDE_tools(params).generate_BMs(1000), detach_graph=True,
-                                            no_grads=True)
-    print(torch.pow(V[:, :].mean(dim=0)-0.04, 2).mean())
-    print(torch.pow(SDE_tools(params).calc_prices(S)-target, 2).mean())
-    plt.plot(V[:5, :].T)
-    plt.show()
+    path = "Neural_SDE" + ".pth"
+    torch.save(model.state_dict(), path)
+    print('--- MODEL TRAINING TIME: %d min %d s ---' % divmod(time.time() - train_time, 60))
 
-    print('done.')
+
+print('done')
