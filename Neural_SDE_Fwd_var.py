@@ -37,7 +37,7 @@ def seed_decorator(func):
         func(*args, **kwargs)
 
         if 'seed' in kwargs.keys():
-            torch.manual_seed(torch.initial_seed())
+            torch.manual_seed(torch.seed())
         return func(*args, **kwargs)
 
     return set_seed
@@ -56,7 +56,7 @@ def log_time(func):
 
 class ModelParams:
 
-    def __init__(self, n_epochs=100, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=35000, test_size=20000,
+    def __init__(self, n_epochs=50, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=30000, test_size=20000,
                  n_time_steps=96, S0=100, V0=0.04, rate=0.025, T=2):
         self.n_epochs = n_epochs
         self.n_layers = n_layers
@@ -112,8 +112,8 @@ class NeuralNetCell(nn.Module):
     @staticmethod
     def init_weights(m):
         if type(m) == nn.Linear:
-            # nn.init.xavier_normal_(m.weight, gain=0.5)
-            nn.init.normal_(m.weight, mean=0.0, std=0.1)
+            nn.init.xavier_normal_(m.weight, gain=0.05)
+            # nn.init.normal_(m.weight, mean=0.0, std=0.05)
             try:
                 m.bias.data.fill_(0.01)
             except:
@@ -121,7 +121,10 @@ class NeuralNetCell(nn.Module):
 
     @staticmethod
     def normalize_input(tensor):
-        return tensor - tensor.mean(dim=0)
+        m = tensor.mean(dim=0).detach()
+        std = tensor.std(dim=0).detach()
+        m[0], std[std == 0.] = 0., 1.  # not de-meaning time, not normalizing by std if constant
+        return (tensor - m)/std
 
     def inputLayer(self, nIn, nOut):
         layer = nn.Sequential(nn.Linear(nIn, nOut, bias=True),
@@ -306,7 +309,7 @@ class SDE_tools:
 
 class Trainer:
 
-    def __init__(self, params, learning_rate=0.05, clip_value=1, milestones=None, gamma=0.1):
+    def __init__(self, params, learning_rate=0.05, clip_value=100, milestones=None, gamma=0.1):
         # super(Trainer, self).__init__()
         if milestones is None:
             milestones = [100, 200]
@@ -335,11 +338,18 @@ class Trainer:
         C_loss, Fwd_loss = self.loss_func(C, C_mkt), self.loss_func(Fwd, Fwd_mkt)
         return ((N + M)*C_loss + lam*N*Fwd_loss)/(2*N + M)  # normalize by batch size?
 
-    def batch_func(self, loss):
+    def batch_func(self, loss, batch_size_old=False):
         # Batch size as a function of upper bound on MC error
-        beta = 0.0015
+        beta = 0.0015; max_increase_ratio = 0.25
         if loss:
-            return int(np.minimum(self.params.batch_size0, 2.576 ** 2 / (4 * beta ** 2 * np.power(loss, 2))))
+            batch_size_new = int(2.576 ** 2 / (4 * beta ** 2 * np.power(loss, 2)))
+            if batch_size_old:
+                increase = np.clip(batch_size_new - batch_size_old,
+                                   a_min=-batch_size_old * max_increase_ratio,
+                                   a_max=batch_size_old * max_increase_ratio)
+                return min(batch_size_old + int(increase), self.params.batch_size0)
+            else:
+                return min(batch_size_new, self.params.batch_size0)
         else:
             return self.params.batch_size0
 
@@ -349,6 +359,7 @@ class Trainer:
 
         # perform gradient clipping
         for p in model.parameters():
+            # p.register_hook(lambda grad: print(grad.max()))
             p.register_hook(lambda grad: torch.clamp(grad, -self.clip_value, self.clip_value))
 
         optimizer = torch.optim.Adam(model.parameters(), lr=0.01, eps=1e-08, amsgrad=True, betas=(0.9, 0.999),
@@ -400,19 +411,17 @@ class Trainer:
                 train_prices, train_fwd_var = self.torch_forward(model, W_batch)
                 # loss = self.loss_func(train_prices, true_prices)
                 loss = self.loss_SPX_fwd(train_prices, true_prices, train_fwd_var, true_fwd_var, loss_lambda(epoch))
-                with torch.no_grad():
-                    opt_loss = self.loss_func(train_prices, true_prices).detach()
 
                 print(' || Backward pass ', end='')
                 self.torch_backprop(loss)
                 optimizer.step()
                 print('\n\t\tMSE loss = {0:.4f}'.format(loss.item()), end='')
-                print('\t\t\t\t|| Total Time: {0:.2f}s & Batch size: {1}'.format(time.time() - timestart, batch_size))
+                print('\t\t Total Time: {0:.2f}s & Batch size: {1}'.format(time.time() - timestart, batch_size))
 
                 # utils.plt_grads(model.diffusionV.h_h[0][0].weight.grad)
                 # scheduler_func.step()
                 batch += batch_size
-                batch_size = self.batch_func(opt_loss)
+                batch_size = self.batch_func(loss.item(), batch_size_old=batch_size)
 
         scheduler.step()
         return model
