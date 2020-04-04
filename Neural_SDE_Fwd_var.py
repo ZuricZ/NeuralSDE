@@ -16,11 +16,48 @@ import itertools
 import math
 import os
 
+if torch.cuda.is_available():
+    device = 'cuda'
+    # Uncomment below to pick particular device if running on a cluster:
+    # torch.cuda.set_device(6)
+    # device='cuda:6'
+    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    device = torch.cuda.current_device()
+
+else:
+    device = 'cpu'
+    torch.set_default_tensor_type('torch.FloatTensor')
+
+
+def seed_decorator(func):
+    def set_seed(*args, **kwargs):
+        if 'seed' in kwargs.keys():
+            torch.manual_seed(kwargs['seed'])
+
+        func(*args, **kwargs)
+
+        if 'seed' in kwargs.keys():
+            torch.manual_seed(torch.seed())
+        return func(*args, **kwargs)
+
+    return set_seed
+
+
+def log_time(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        retval = func(*args, **kwargs)
+        end_time = time.time()
+        print('Elapsed time: {:.2f}'.format(end_time - start_time), end='')
+        return retval
+
+    return wrapper
+
 
 class ModelParams:
 
-    def __init__(self, n_epochs=10, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=20000, test_size=20000,
-                 n_time_steps=96, S0=100, V0=0.04, rate=0.025, T=2):  # r = 0.025
+    def __init__(self, n_epochs=100, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=35000, test_size=20000,
+                 n_time_steps=96, S0=100, V0=0.04, rate=0.025, T=2):
         self.n_epochs = n_epochs
         self.n_layers = n_layers
         self.vNetWidth = vNetWidth
@@ -181,31 +218,6 @@ class Net_SDE(nn.Module):
         return torch.cat([price_call_mat, price_put_mat], 0), Fwd_var_vec
 
 
-def seed_decorator(func):
-    def set_seed(*args, **kwargs):
-        if 'seed' in kwargs.keys():
-            torch.manual_seed(kwargs['seed'])
-
-        func(*args, **kwargs)
-
-        if 'seed' in kwargs.keys():
-            torch.manual_seed(torch.seed())
-        return func(*args, **kwargs)
-
-    return set_seed
-
-
-def log_time(func):
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        retval = func(*args, **kwargs)
-        end_time = time.time()
-        print('Elapsed time: {:.2f}'.format(end_time - start_time), end='')
-        return retval
-
-    return wrapper
-
-
 class SDE_tools:
 
     def __init__(self, params):
@@ -345,7 +357,9 @@ class Trainer:
 
         # fix the seeds for reproducibility and generate antithetics and pass to torch
         W_test = self.tools.generate_BMs(self.params.test_size, antithetics=True, seed=0)
+        W_test = W_test[0].to(device=device), W_test[1].to(device=device)
         W = self.tools.generate_BMs(self.params.MC_samples, antithetics=True, seed=1)
+        W = W[0].to(device=device), W[1].to(device=device)
 
         for epoch in range(self.params.n_epochs):
             # evaluate and print test error at the start of each epoch
@@ -404,10 +418,10 @@ if __name__ == "__main__":
     start_time = time.time()
     timegrid = params.time_grid
     # Load market prices and set training target
-    ITM_call = torch.load('ITM_call.pt')
-    ITM_put = torch.load('ITM_put.pt')
-    OTM_call = torch.load('OTM_call.pt')
-    OTM_put = torch.load('OTM_put.pt')
+    ITM_call = torch.load('ITM_call.pt').to(device=device)
+    ITM_put = torch.load('ITM_put.pt').to(device=device)
+    OTM_call = torch.load('OTM_call.pt').to(device=device)
+    OTM_put = torch.load('OTM_put.pt').to(device=device)
     C_mkt = torch.cat([ITM_call, OTM_call], 1)[:len(params.maturities), :]
     P_mkt = torch.cat([OTM_put, ITM_put], 1)[:len(params.maturities), :]
     target = torch.cat([C_mkt, P_mkt], 0)
