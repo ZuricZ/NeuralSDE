@@ -3,7 +3,7 @@
 
 import torch
 import torch.nn as nn
-import torchviz
+# import torchviz
 # from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 # from backward_pass import backprop
@@ -37,7 +37,7 @@ def seed_decorator(func):
         func(*args, **kwargs)
 
         if 'seed' in kwargs.keys():
-            torch.manual_seed(torch.seed())
+            torch.manual_seed(torch.initial_seed())
         return func(*args, **kwargs)
 
     return set_seed
@@ -306,7 +306,7 @@ class SDE_tools:
 
 class Trainer:
 
-    def __init__(self, params, learning_rate=0.05, milestones=None, gamma=0.1):
+    def __init__(self, params, learning_rate=0.05, clip_value=1, milestones=None, gamma=0.1):
         # super(Trainer, self).__init__()
         if milestones is None:
             milestones = [100, 200]
@@ -314,6 +314,7 @@ class Trainer:
         self.params = params
         self.tools = SDE_tools(params)
         self.learning_rate = learning_rate
+        self.clip_value = clip_value
 
     @staticmethod
     @log_time
@@ -345,6 +346,11 @@ class Trainer:
     def train_models(self, true_prices, true_fwd_var):
 
         model = Net_SDE(self.params)
+
+        # perform gradient clipping
+        for p in model.parameters():
+            p.register_hook(lambda grad: torch.clamp(grad, -self.clip_value, self.clip_value))
+
         optimizer = torch.optim.Adam(model.parameters(), lr=0.01, eps=1e-08, amsgrad=True, betas=(0.9, 0.999),
                                      weight_decay=0)
         # optimizer= torch.optim.Rprop(model.parameters(), lr=0.001, etas=(0.5, 1.2), step_sizes=(1e-07, 1))
