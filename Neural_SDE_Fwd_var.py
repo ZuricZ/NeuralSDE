@@ -37,7 +37,8 @@ def seed_decorator(func):
         func(*args, **kwargs)
 
         if 'seed' in kwargs.keys():
-            torch.manual_seed(torch.seed())
+            # torch.manual_seed(torch.seed())
+            torch.default_generator.seed()
         return func(*args, **kwargs)
 
     return set_seed
@@ -56,7 +57,7 @@ def log_time(func):
 
 class ModelParams:
 
-    def __init__(self, n_epochs=50, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=30000, test_size=20000,
+    def __init__(self, n_epochs=5, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=30000, test_size=20000,
                  n_time_steps=96, S0=100, V0=0.04, rate=0.025, T=2):
         self.n_epochs = n_epochs
         self.n_layers = n_layers
@@ -135,7 +136,7 @@ class NeuralNetCell(nn.Module):
 
     def hiddenLayerT1(self, nIn, nOut):
         layer = nn.Sequential(nn.Linear(nIn, nOut, bias=True),
-                              # nn.BatchNorm1d(nOut, momentum=0.1),
+                              # nn.BatchNorm1d(nOut, momentum=0.01),
                               self.activation)
         layer.apply(self.init_weights)
         return layer
@@ -340,7 +341,7 @@ class Trainer:
 
     def batch_func(self, loss, batch_size_old=False):
         # Batch size as a function of upper bound on MC error
-        beta = 0.0015; max_increase_ratio = 0.25
+        beta = 0.01; max_increase_ratio = 0.25
         if loss:
             batch_size_new = int(2.576 ** 2 / (4 * beta ** 2 * np.power(loss, 2)))
             if batch_size_old:
@@ -446,8 +447,13 @@ if __name__ == "__main__":
 
     model = Trainer(params).train_models(target, Fwd_var_mkt)  # TODO: rho becomes positive
     print('--- MODEL TRAINING TIME: %d min %d s ---' % divmod(time.time() - start_time, 60))
+
+    path = f'./models/{os.path.basename(__file__).split(".")[0]}_model_{time.strftime("%Y-%m-%d-%H%M%S")}.pth'
+    torch.save(model.state_dict(), path)
+
     S, V = SDE_tools(params).generate_paths(model, SDE_tools(params).generate_BMs(1000), detach_graph=True,
                                             no_grads=True)
+
     print(torch.pow(V[:, :].mean(dim=0)-0.04, 2).mean())
     print(torch.pow(SDE_tools(params).calc_prices(S)-target, 2).mean())
     plt.plot(V[:5, :].T)
