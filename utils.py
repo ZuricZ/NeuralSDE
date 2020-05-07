@@ -4,6 +4,11 @@ import matplotlib.pyplot as plt
 from scipy import stats
 import time
 
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.ticker import LinearLocator, FormatStrFormatter
+
 
 class GradPlot:
     def __init__(self):
@@ -90,3 +95,19 @@ def losses_reg(x, y):
     for idx, (slope, intercept, std) in enumerate(zip(slopes, intercepts, stds)):
         plt.plot(x[idx * 50: min(idx * 50 + 50, len(x))], x[idx * 50: min(idx * 50 + 50, len(x))] * slope + intercept)
         print(idx * 50, min(idx * 50, len(x)))
+
+
+def plot2d_output(model):
+    from matplotlib import cm
+    X = torch.linspace(0, 2).unsqueeze(1)
+    Y = torch.linspace(-2, 2).unsqueeze(1)
+    x, y = np.meshgrid(X.numpy(), Y.numpy())
+    Z = model.nu(torch.cat([X, Y], 1)).detach().numpy()
+
+    fig = plt.figure()
+    ax = fig.gca(projection='3d')
+
+    surf = ax.plot_surface(x, y, Z, cmap=cm.coolwarm, linewidth=0, antialiased=False)
+    fig.colorbar(surf, shrink=0.5, aspect=5)
+    plt.show()
+
