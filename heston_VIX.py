@@ -4,7 +4,7 @@ import QuantLib as ql
 
 
 class HestonParams:
-    def __init__(self, S0=100, V0=0.04, r=0.025, kappa=1.5, theta=0.04, sigma=0.30, rho=-0.9):
+    def __init__(self, S0=10, V0=0.04, r=0.0, kappa=1.5, theta=0.05, sigma=0.80, rho=-0.9):
         self.S0 = S0
         self.V0 = V0
         self.r = r
@@ -45,21 +45,20 @@ def Simulate_Heston_QuantLib(NumOfAssets=10, TimeSteps=30, dt=1. / 365,
     return S, V
 
 
-def price(S0=100, K=100, V0=0.04, r=0.025, kappa=1, theta=0.04, sigma=0.8, rho=-0.7, TimeSteps=30):
-
+def price(S0=100, K=100, r=0.025, T=30, V0=0.04, kappa=1.0, theta=0.04, sigma=0.8, rho=-0.7, type='c'):
+    assert type == 'c' or type == 'p'
     today = ql.Date(1, ql.December, 2018)
     ql.Settings.instance().evaluationDate = today
     riskFreeRate = ql.FlatForward(today, r, ql.Actual365Fixed())
     dividendRate = ql.FlatForward(today, 0.0, ql.Actual365Fixed())
 
     # maturity_date = ql.Date(31, ql.December, 2018)
-    maturity_date = today + TimeSteps
+    maturity_date = today + T
 
-    payoff = ql.PlainVanillaPayoff(ql.Option.Call, K)
+    payoff = ql.PlainVanillaPayoff(ql.Option.Call if type == 'c' else ql.Option.Put, K)
     exercise = ql.EuropeanExercise(maturity_date)
     european_option = ql.VanillaOption(payoff, exercise)
 
-    # discretization = Reflection  # PartialTrunction, FullTruncation, Reflection, ExactVariance
     heston_process = ql.HestonProcess(ql.YieldTermStructureHandle(riskFreeRate),
                                       ql.YieldTermStructureHandle(dividendRate),
                                       ql.QuoteHandle(ql.SimpleQuote(S0)),  # S0
@@ -111,24 +110,60 @@ def heston_VIX_opt(VIX, K, r, t, type='call'):
 
 
 if __name__ == "__main__":
-    params = HestonParams()
-    strikes_put = np.array([55, 60, 65, 70, 75, 80, 85, 90, 95, 100])
-    strikes_call = np.array([100, 105, 110, 115, 120, 125, 130, 135, 140, 145])
-    strikes = np.concatenate([strikes_put, strikes_call])
-    maturities = np.array([2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48])
-    # S, V = Simulate_Heston_QuantLib(NumOfAssets=60000, TimeSteps=48, dt=1./720)
     np.random.seed(1)
+    params = HestonParams()
+    strikes_put = params.S0 * np.array([.55, .60, .65, .70, .75, .80, .85, .90, .95, 1.00])
+    strikes_call = params.S0 * np.array([1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40, 1.45])
+    strikes = np.concatenate([strikes_put, strikes_call])
+    vix_strikes = np.sqrt(heston_VIX2(params.V0, params.kappa, params.theta))*np.array([.5, .6, .7, .8, .9, 1.0,
+                                                                                        1.1, 1.2, 1.3, 1.4, 1.5])
+    maturities_idx = np.array([2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24,
+                               26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48])
 
-    # VIX2 = heston_VIX2(V, params.kappa, params.theta)
-    # Fwd_price = heston_VIX_fwd(np.sqrt(VIX2))
+    timegrid = np.linspace(0, 2, 48+1)
+    maturities = (timegrid[maturities_idx]*360).astype(int)  # QuantLib needs maturities in days
 
-    Fwd = np.zeros(len(maturities))
-
+    VIX_fwd = np.zeros(len(maturities))
     for idx, maturity in enumerate(maturities):
         print(f'Calculating maturity: {maturity}')
-        S, V = Simulate_Heston_QuantLib(NumOfAssets=60000, TimeSteps=int(maturity*15), dt=1./720)
-        Fwd[idx] = heston_VIX_fwd(np.sqrt(heston_VIX2(V, params.kappa, params.theta)))
+        S, V = Simulate_Heston_QuantLib(NumOfAssets=75000, TimeSteps=maturity, dt=1./720)
+        VIX_fwd[idx] = heston_VIX_fwd(np.sqrt(heston_VIX2(V, params.kappa, params.theta)))
 
-    np.save('VIX_heston_forwards.npy', Fwd)
+    np.save(f'heston_r={params.r}_S0={params.S0}_V0={params.V0}_kappa={params.kappa}_theta={params.theta}_sigma='
+            f'{params.sigma}_rho={params.rho}_VIXfwd', VIX_fwd)
+
+    # heston_call_prices = np.zeros((len(maturities), len(strikes)))
+    # heston_put_prices = np.zeros((len(maturities), len(strikes)))
+    # for i, maturity in enumerate(maturities):
+    #     for j, strike in enumerate(strikes):
+    #         heston_call_prices[i, j] = price(S0=params.S0, K=strike, r=params.r, T=maturity,
+    #                                          V0=params.V0, kappa=params.kappa, theta=params.theta, sigma=params.sigma,
+    #                                          rho=params.rho, type='c')
+    #         heston_put_prices[i, j] = price(S0=params.S0, K=strike, r=params.r, T=maturity,
+    #                                         V0=params.V0, kappa=params.kappa, theta=params.theta, sigma=params.sigma,
+    #                                         rho=params.rho, type='p')
+    #
+    # np.save(f'heston_r={params.r}_S0={params.S0}_V0={params.V0}_kappa={params.kappa}_theta={params.theta}_sigma='
+    #         f'{params.sigma}_rho={params.rho}_call', heston_call_prices)
+    # np.save(f'heston_r={params.r}_S0={params.S0}_V0={params.V0}_kappa={params.kappa}_theta={params.theta}_sigma='
+    #         f'{params.sigma}_rho={params.rho}_put', heston_put_prices)
+
+    heston_VIX_call_prices = np.zeros((len(maturities), len(vix_strikes)))
+    heston_VIX_put_prices = np.zeros((len(maturities), len(vix_strikes)))
+    for i, maturity in enumerate(maturities):
+        print(f'Maturity: {maturity}')
+        S, V = Simulate_Heston_QuantLib(NumOfAssets=75000, TimeSteps=maturity, dt=1. / 720,
+                                        S0=params.S0, V0=params.V0, r=params.r, kappa=params.kappa,
+                                        theta=params.theta, sigma=params.sigma, rho=params.rho)
+        for j, vix_strike in enumerate(vix_strikes):
+            print(f'\tStrike: {vix_strike}')
+            vix = np.sqrt(heston_VIX2(V, params.kappa, params.theta))
+            heston_VIX_call_prices[i, j] = np.mean(np.maximum(vix[-1, :] - vix_strike, 0.))*np.exp(-params.r * maturity)
+            heston_VIX_put_prices[i, j] = np.mean(np.maximum(vix_strike - vix[-1, :], 0.))*np.exp(-params.r * maturity)
+
+    np.save(f'heston_r={params.r}_S0={params.S0}_V0={params.V0}_kappa={params.kappa}_theta={params.theta}_sigma='
+            f'{params.sigma}_rho={params.rho}_VIXcall', heston_VIX_call_prices)
+    np.save(f'heston_r={params.r}_S0={params.S0}_V0={params.V0}_kappa={params.kappa}_theta={params.theta}_sigma='
+            f'{params.sigma}_rho={params.rho}_VIXput', heston_VIX_put_prices)
 
     print('end')

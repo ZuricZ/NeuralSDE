@@ -57,7 +57,7 @@ def log_time(func):
 
 class ModelParams:
 
-    def __init__(self, n_epochs=3, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=30000, test_size=20000,
+    def __init__(self, n_epochs=1, n_layers=2, vNetWidth=20, MC_samples=200000, batch_size0=30000, test_size=20000,
                  n_time_steps=96, S0=100, V0=0.04, rate=0.025, T=2):
         self.n_epochs = n_epochs
         self.n_layers = n_layers
@@ -173,43 +173,54 @@ class Net_SDE(nn.Module):
         # Input to the coefficient (NN) will be (t,T,xi_t)
         self.nu = NeuralNetCell(dim=2, nOut=1, n_layers=params.n_layers, vNetWidth=params.vNetWidth,
                                 act_output='softp')  # We restrict diffusion coefficients to be positive
-        # Input to the coefficient (NN) will be (t)
-        self.rho = NeuralNetCell(dim=1, nOut=1, n_layers=1, vNetWidth=2,
-                                 act_output='tanh')  # restrict rho to [-1,1]
+        # self.f = NeuralNetCell(dim=1, nOut=1, n_layers=1, vNetWidth=2, act_output='softp')
+        # self.rho = NeuralNetCell(dim=1, nOut=1, n_layers=1, vNetWidth=2,1
+        #                          act_output='tanh')  # restrict rho to [-1,1]
+
+        self.rho = nn.Parameter(-0.9*torch.ones(1, device=device), requires_grad=True)
 
     def forward(self, W, scheme='reflection'):
         if scheme not in {'absorption', 'reflection'}:
             raise ValueError('Wrong discretization scheme.')
         dW, dB = W
-        zeros, ones = torch.zeros(dW.shape[0], 1), torch.ones(dW.shape[0], 1)
+        zeros, ones = torch.zeros(dW.shape[0], 1, device=device), torch.ones(dW.shape[0], 1, device=device)
 
-        S_t, xi_t = ones * self.params.S0, ones * self.params.V0  # TODO: xi_t really V0 ?
+        S_t, xi_t = ones * self.params.S0, ones * self.params.V0
         B_lambda = zeros
+        # dB_lambda = torch.zeros_like(dW, device=device)
+        # BM_integral = zeros
 
-        price_call_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes))
-        price_put_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes))
-        Fwd_var_vec = torch.zeros(len(self.params.maturities)+1)
-        VIX_fwd_vec = torch.zeros(len(self.params.maturities)+1)
+        price_call_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes), device=device)
+        price_put_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes), device=device)
+        Fwd_var_vec = torch.zeros(len(self.params.maturities)+1, device=device)
+        VIX_fwd_vec = torch.zeros(len(self.params.maturities)+1, device=device)
 
         discount_factor = lambda t: torch.exp(-self.params.rate * t)
         VIX_delta = (self.params.time_grid[0 + self.params.monthly_step] - self.params.time_grid[0])
 
+        # Brownian motion increments
+        # for idx, t in enumerate(self.params.time_grid[:-1], 1):
+        #     dB_new = torch.sqrt(1 - torch.pow(self.rho, 2)) * dB[:, idx-1, None] \
+        #             + self.rho * dW[:, idx-1, None]
+        #     dB_lambda[:, idx] = dB_new.squeeze()
+
         # Euler-Maruyama S_t, V_t
         for idx, t in enumerate(self.params.time_grid[:-1], 1):
             input_sigma = torch.cat([ones * t, S_t, xi_t], 1)
-            # input_nu = [torch.cat([tau, B_lambda], 1) for tau in self.params.time_grid[[0] + self.params.maturities]]
-            input_nu = torch.cat([zeros, B_lambda], 1)
-
             # absorption ensures positive stock price
             S_new = S_t * (1 + self.params.rate * self.params.h) + self.sigma(input_sigma) * dW[:, idx - 1, None]
             S_t = torch.max(S_new, zeros)
 
+            # BM_new = BM_integral + self.f(t*ones)*(torch.sqrt(1 - torch.pow(self.rho, 2)) * dB[:, idx - 1, None]
+            #         + self.rho * dW[:, idx - 1, None])
+            # BM_integral = BM_new
+
+            input_nu = torch.cat([zeros, B_lambda], 1)
             xi_t = self.nu(input_nu)
-            # xi_t = torch.max(xi_new, zeros) if scheme == 'absorption' else torch.abs(xi_new)
 
             if idx in [0] + self.params.maturities:
                 idx_t = self.params.maturities.index(idx)
-                inputs_VIX = torch.zeros(dW.shape[0], self.params.monthly_step)
+                inputs_VIX = torch.zeros(dW.shape[0], self.params.monthly_step, device=device)
 
                 for idx_s, s in enumerate(self.params.time_grid[idx: idx + self.params.monthly_step]):
                     inputs_VIX[:, idx_s] = self.nu(torch.cat([s*ones, B_lambda], 1)).squeeze()
@@ -225,12 +236,11 @@ class Net_SDE(nn.Module):
                 Fwd_var_vec[idx_t] = xi_t.mean()
                 VIX_fwd_vec[idx_t] = VIX_t.mean()
 
-            B_new = B_lambda + torch.sqrt(1 - torch.pow(self.rho(ones * t), 2)) * dB[:, idx - 1, None] \
-                    + self.rho(ones * t) * dW[:, idx - 1, None]
+            B_new = B_lambda + torch.sqrt(1 - torch.pow(self.rho, 2)) * dB[:, idx - 1, None] \
+                    + self.rho * dW[:, idx - 1, None]
             B_lambda = B_new
 
         return torch.cat([price_call_mat, price_put_mat], 0), Fwd_var_vec, VIX_fwd_vec
-
 
 
 class SDE_tools:
@@ -258,7 +268,7 @@ class SDE_tools:
         dW, dB = W[0], W[1]
 
         MC_samples = dW.shape[0]
-        zeros, ones = torch.zeros(MC_samples, 1), torch.ones(MC_samples, 1)
+        zeros, ones = torch.zeros(MC_samples, 1, device=device), torch.ones(MC_samples, 1, device=device)
         S, V = torch.zeros((MC_samples, len(self.params.time_grid))), torch.zeros(
             (MC_samples, len(self.params.time_grid)))
         S[:, 0] = self.params.S0
@@ -268,6 +278,7 @@ class SDE_tools:
             # Euler-Maruyama S_t, V_t
             for idx, t in enumerate(self.params.time_grid[1:]):
                 input_sigma = torch.cat([ones * t, S[:, idx, None], V[:, idx, None]], 1)
+
                 input_nu = torch.cat([zeros, B_lambda], 1)
 
                 # absorption ensures positive stock price
@@ -278,8 +289,11 @@ class SDE_tools:
                 # V[:, idx + 1] = torch.max(V_temp.squeeze(), zeros.squeeze()) \
                 #     if scheme == 'absorption' else torch.abs(V_temp.squeeze())
 
-                B_lambda += torch.sqrt(1 - torch.pow(model.rho(ones * t), 2)) * dB[:, idx, None] \
-                            + model.rho(ones * t) * dW[:, idx, None]
+                B_lambda += torch.sqrt(1 - torch.pow(model.rho, 2)) * dB[:, idx, None] \
+                            + model.rho * dW[:, idx, None]
+
+                # B_lambda += model.f(t*ones)*torch.sqrt(1 - torch.pow(model.rho, 2)) * dB[:, idx, None] \
+                #             + model.rho * dW[:, idx, None]
 
             input_nu = torch.cat([zeros, B_lambda], 1)
             V[:, idx+1] = model.nu(input_nu).squeeze()
@@ -299,12 +313,12 @@ class SDE_tools:
         discount_factor = lambda t: torch.exp(-self.params.rate * t)
         condition = S.squeeze().ndimension() <= 1
         if condition:
-            price_call_mat = torch.zeros(1, len(self.params.strikes))
-            price_put_mat = torch.zeros(1, len(self.params.strikes))
+            price_call_mat = torch.zeros(1, len(self.params.strikes), device=device)
+            price_put_mat = torch.zeros(1, len(self.params.strikes), device=device)
             S_T = S.view(-1, 1)
         else:
-            price_call_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes))
-            price_put_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes))
+            price_call_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes), device=device)
+            price_put_mat = torch.zeros(len(self.params.maturities), len(self.params.strikes), device=device)
             S_T = S[:, self.params.maturities]
             mat = self.params.time_grid[self.params.maturities]
 
@@ -365,8 +379,8 @@ class Trainer:
 
     def batch_func(self, loss, batch_size_old=False):
         # Batch size as a function of upper bound on MC error
-        beta = 0.01
-        max_increase_ratio = 0.25
+        beta = 0.0075
+        max_increase_ratio = 0.1
         if loss:
             batch_size_new = int(2.576 ** 2 / (4 * beta ** 2 * np.power(loss, 2)))
             if batch_size_old:
@@ -379,14 +393,15 @@ class Trainer:
         else:
             return self.params.batch_size0
 
+    # noinspection PyTypeChecker
     def train_models(self, true_prices, true_fwd_var, true_VIX_fwd):
 
         model = Net_SDE(self.params)
 
         # perform gradient clipping
-        for p in model.parameters():
+        # for p in model.parameters():
             # p.register_hook(lambda grad: print(grad.max()))
-            p.register_hook(lambda grad: torch.clamp(grad, -self.clip_value, self.clip_value))
+            # p.register_hook(lambda grad: torch.clamp(grad, -self.clip_value, self.clip_value))
 
         optimizer = torch.optim.Adam(model.parameters(), lr=0.01, eps=1e-08, amsgrad=True, betas=(0.9, 0.999),
                                      weight_decay=0)
@@ -420,7 +435,7 @@ class Trainer:
             # test_loss = self.loss_func(test_prices, target)
 
             batch = 0
-            batch_size = max(100, self.batch_func(opt_test_loss))
+            batch_size = max(500, self.batch_func(False))
 
             print('------------------------------------------------------------------------------')
             print('Epoch: {} ~ Batch size: {}'.format(epoch, batch_size))
@@ -439,14 +454,23 @@ class Trainer:
                 print('\t\tForward pass ', end='')
                 train_prices, train_fwd_var, train_VIX_fwd = self.torch_forward(model, W_batch)
                 # nu_0s = model.nu(self.params.time_grid[[0] + self.params.maturities].unsqueeze(1))
-                nu_input = torch.cat([torch.zeros(100, 1), torch.zeros(100, 1)], 1)
+                nu_input = torch.cat([2*torch.rand(1000, 1), torch.randn(1000, 1)], 1).requires_grad_()
                 opt_loss = self.loss_func(train_prices, true_prices)
                 fwd_loss = self.loss_func(train_fwd_var, true_fwd_var)
                 VIX_fwd_loss = self.loss_func(train_VIX_fwd, true_VIX_fwd)
-                loss = opt_loss + fwd_loss + VIX_fwd_loss  # + self.loss_sup_func(model.nu(nu_input), torch.ones(100, 1)*self.params.V0)  # TODO: get rid of this loss
+                # grad_loss = torch.sum(torch.pow(torch.autograd.grad(model.nu(nu_input), nu_input, grad_outputs=torch.ones(1000, 1),
+                #                                 create_graph=True)[0] - 1, 2))
+                grad_input = torch.autograd.grad(model.nu(nu_input), nu_input, grad_outputs=torch.ones(1000, 1),
+                                                create_graph=True)[0]
+                grad_input2 = torch.autograd.grad(grad_input, nu_input, grad_outputs=torch.ones(1000, 2),
+                                                create_graph=True)[0]
+                martingale_loss = torch.sum(torch.pow(grad_input[:, 0] - grad_input2[:, 1], 2))
+                loss = opt_loss + 10*fwd_loss + 10*VIX_fwd_loss + 0.01*martingale_loss
+                # + self.loss_sup_func(model.nu(nu_input), torch.ones(100, 1)*self.params.V0)
 
                 print(' || Backward pass ', end='')
                 self.torch_backprop(loss)
+                nn.utils.clip_grad_norm_(model.parameters(), 1)
                 optimizer.step()
                 print('\n\t\tMSE loss = {0:.4f}'.format(loss.item()), end='')
                 print('\t\t Total Time: {0:.2f}s & Batch size: {1}'.format(time.time() - timestart, batch_size))
@@ -456,7 +480,8 @@ class Trainer:
                 # utils.plt_grads(model.diffusionV.h_h[0][0].weight.grad)
                 # scheduler_func.step()
                 batch += batch_size
-                batch_size = max(100, self.batch_func(opt_loss.item(), batch_size_old=batch_size))
+                # batch_size = max(500, self.batch_func(opt_loss.item(), batch_size_old=batch_size))
+                batch_size = self.batch_func(False)
 
         scheduler.step()
         return model
@@ -481,7 +506,7 @@ if __name__ == "__main__":
     VIX_fwd_mkt = np.insert(VIX_fwd_mkt, 0, params.V0)
     VIX_fwd_mkt = torch.from_numpy(VIX_fwd_mkt)
 
-    model = Trainer(params).train_models(target, Fwd_var_mkt, VIX_fwd_mkt)  # TODO: rho becomes positive
+    model = Trainer(params).train_models(target, Fwd_var_mkt, VIX_fwd_mkt)
     print('--- MODEL TRAINING TIME: %d min %d s ---' % divmod(time.time() - start_time, 60))
 
     path = f'./models/{os.path.basename(__file__).split(".")[0]}_model_{time.strftime("%Y-%m-%d-%H%M%S")}.pth'
